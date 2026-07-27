@@ -1,0 +1,32 @@
+# Large Language Model Weights
+*.gguf
+*.bin
+*.onnx
+*.safetensors
+
+# Build & Compilation Artifacts
+build/
+bin/
+out/
+Release/
+Debug/
+x64/
+*.obj
+*.exe
+*.dll
+*.lib
+
+# Editor & System Files
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+Thumbs.db
+Desktop.ini
+
+# Logs & Temporary Files
+*.log
+logs/
+tmp/
+*.tmp
