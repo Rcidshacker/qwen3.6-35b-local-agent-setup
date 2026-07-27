@@ -9,13 +9,14 @@
 
 A battle-tested production guide, custom CUDA build pipeline, and automation setup for running **Qwen3.6-35B-A3B** (35B hybrid SSM/MoE) on **consumer 6GB Laptop GPUs** (RTX 4050 / GTX 1060 class) paired with 24GB DDR5 RAM. 
 
-This repository moves past synthetic chat benchmarks to demonstrate how to sustain **128K context windows** under demanding multi-hour, multi-file **autonomous coding agent tasks** (Hermes Agent) without out-of-memory crashes.
+This setup takes direct inspiration from **Codacus**'s optimization walkthrough—[*"Run Qwen 3.6 35B at 17 tokens/sec on 8-year-old hardware"*](https://youtu.be/8F_5pdcD3HY)—and adapts its principles for modern laptop hardware and demanding multi-hour **autonomous coding agent tasks** (Hermes Agent).
 
 ---
 
 ## 📑 Table of Contents
 
 - [Overview](#-overview)
+- [Inspiration: Video Breakdown & Adaptation](#-inspiration-video-breakdown--adaptation)
 - [Architecture & Memory Flow](#-architecture--memory-flow)
 - [Key Engineering Insights](#-key-engineering-insights)
 - [Context Scaling & Real Agent Benchmark](#-context-scaling--real-agent-benchmark)
@@ -39,6 +40,26 @@ Running a 35B parameter mixture-of-experts (MoE) LLM locally usually requires 24
 - **Backend:** Custom MSVC + CUDA 13.3 build of `TheTom/llama-cpp-turboquant` (`feature/turboquant-kv-cache`).
 - **Context Window:** **128,072 tokens** supported stably at ~14 t/s initial generation speed.
 - **Agent Integration:** Connected via standard OpenAI API endpoint to local **Hermes Agent**.
+
+---
+
+## 📹 Inspiration: Video Breakdown & Adaptation
+
+This setup adapts the benchmark optimization pipeline demonstrated by **Codacus** ([Video Link](https://youtu.be/8F_5pdcD3HY)) for running Qwen 3.6 35B on an 8-year-old desktop setup (GTX 1060 6GB VRAM, i3-8100, 24GB DDR4). 
+
+Below is the comparison between the reference video steps and our modern laptop adaptation (RTX 4050 6GB Laptop, i5-13450HX, 24GB DDR5):
+
+### Codacus Reference Video vs. Laptop Agent Adaptation
+
+| Step | Codacus Video Optimization (GTX 1060, 24GB DDR4) | Laptop Agent Adaptation (RTX 4050, 24GB DDR5) | Adaptation Rationale & Hardware Differences |
+| :--- | :--- | :--- | :--- |
+| **1. Baseline** | Naive split `-L 20` (3 t/s) | Avoided naive manual split | Every layer has MoE blocks; straddling PCIe bus causes severe bottlenecks. |
+| **2. Expert Offload** | `--n-cpu-moe 41` (10 t/s) | Handled dynamically by `--fit` | Pinned sleeping MoE experts to RAM; `--fit` auto-tunes tensor offloading without manual guesswork. |
+| **3. Disable mmap** | `--no-mmap` (13.5 t/s) | Default OS `mmap` enabled | **Reverted:** `--no-mmap` demands one contiguous block, triggering `std::bad_alloc` (`0xc0000409`) on 24GB Windows. |
+| **4. Reclaim VRAM** | `--n-cpu-moe 35` (17 t/s) | `-fit -fitt 400` | Auto-fits max dense layers on GPU while keeping a 400 MiB safety margin. |
+| **5. TurboQuant** | `-ctk turbo4 -ctv turbo3` (256k) | `-ctk turbo4 -ctv turbo3` (128k default) | **128k selected:** Empirically yielded 3× higher audit thoroughness on multi-document agent tasks than 256k. |
+| **6. RAM Lock** | `--mlock` (System stability) | Omitted (mmap used) | Prevents hard memory locking crashes near the 24GB Windows ceiling. |
+| **7. Speculative** | Tested & Rejected (11 t/s drop) | Rejected | Hybrid SSM (30/40 layers) + MoE routing thrash sequential execution across draft windows. |
 
 ---
 

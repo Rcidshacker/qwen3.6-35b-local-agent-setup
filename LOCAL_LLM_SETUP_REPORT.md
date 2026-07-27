@@ -18,13 +18,21 @@
 
 ---
 
-## 1. Motivation
+## 1. Motivation & Reference Walkthrough
 
-A YouTube walkthrough by Codacus — [*"Run Qwen 3.6 35B at 17 tokens/sec on 8-year-old hardware"*](https://youtu.be/8F_5pdcD3HY) — demonstrated a 5-step llama.cpp optimization sequence — MoE-expert CPU offloading, disabling mmap, reclaiming idle VRAM, and a custom KV-cache quantization scheme called *TurboQuant* — to run a 35B MoE model at usable speed on a GTX 1060 (6GB VRAM, 24GB RAM). The goal here was to reproduce and adapt that pipeline for a modern equivalent (RTX 4050 laptop, same VRAM class), then go one step further: connect it to a real local agent (Hermes) and prove the setup holds up under actual multi-hour, multi-file agentic work — not just a chat completion.
+This project took direct inspiration from a YouTube optimization guide by **Codacus** — [*"Run Qwen 3.6 35B at 17 tokens/sec on 8-year-old hardware"*](https://youtu.be/8F_5pdcD3HY). Codacus demonstrated a 5-step `llama.cpp` optimization sequence on minimal hardware (NVIDIA GTX 1060 6GB VRAM, Intel i3-8100 CPU, 24GB DDR4 RAM):
 
-Two claims from the video needed independent verification before building around them:
-- **TurboQuant is not a mainline llama.cpp feature.** It exists only in a community fork (`TheTom/llama-cpp-turboquant`), gated behind CUDA-only kernels.
-- **The optimization steps are architecture- and hardware-specific.** They needed to be re-derived, not copy-pasted, for a different GPU (Ada Lovelace vs. Pascal) and a different, newer model architecture (Qwen3.6's hybrid Mamba/SSM design vs. a pure transformer).
+### Codacus's Original 5-Step Optimization Sequence:
+1. **Naive Baseline (`-L 20` / `-ngl 20`):** Splitting layers 50/50 between CPU and GPU resulted in unusable performance (~3 tokens/sec) due to massive PCIe bus thrashing across MoE expert layers.
+2. **Pin Experts to CPU RAM (`--n-cpu-moe 41`):** Offloaded sparse, "sleeping" MoE expert blocks to CPU RAM while keeping dense attention layers on GPU. Boosted speed from **3 t/s to 10 t/s**.
+3. **Disable Memory Mapping (`--no-mmap`):** Forced preloading the entire model into system RAM up front to avoid disk page faults. Boosted speed from **10 t/s to 13.5 t/s**.
+4. **Reclaim Idle VRAM (`--n-cpu-moe 35`):** Pulled 6 additional layers back onto the GPU to utilize remaining VRAM. Boosted speed from **13.5 t/s to 17 t/s** (reducing context to 64K).
+5. **TurboQuant KV-Cache (`--kv-type-k turbo4 --kv-type-v turbo3`):** Applied 4-bit key / 3-bit value quantization to expand context from 64K to **256,000 tokens** at a sustained 17 t/s without running out of VRAM.
+6. **Lock System RAM (`--mlock`):** Locked model weights in memory to prevent OS disk-paging over multi-day sessions.
+7. **Speculative Decoding (Tested & Rejected):** Drafted with Qwen3.5 800M. Despite a 65% draft acceptance rate, speed dropped from 17 t/s down to 11 t/s because batching 8 speculative tokens thrashed 64 distinct experts over PCIe, and the 30 SSM/Mamba layers required sequential processing per step.
+
+### Goal of This Setup
+The objective was to reproduce and adapt Codacus's pipeline for a modern equivalent (**RTX 4050 Laptop GPU, 6GB VRAM, i5-13450HX, 24GB DDR5 RAM**), while adjusting flags to respect laptop hardware boundaries and validating the setup under multi-hour, multi-file **autonomous agentic workloads** (Hermes Agent) rather than simple single-turn prompts.
 
 ---
 
@@ -66,19 +74,24 @@ qwen35moe.ssm.*                        # the other 3 in 4 are Gated Delta Net (S
 
 ---
 
-## 4. Baseline: Reproducing the 5-Step Optimization
+## 4. Baseline: Adapting the Video Pipeline to Laptop Hardware
 
-Run first on the WinGet Vulkan build, `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (~20.8GB):
+Running initial tests on `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (~20.8GB) highlighted key differences between desktop and laptop hardware constraints:
 
-| Step | Flag(s) | Effect |
-|---|---|---|
-| 1. Naive baseline | `-ngl 20` (half GPU/CPU split) | Unusable — every MoE layer straddles the PCIe bus |
-| 2. Pin experts to CPU | `--n-cpu-moe N` | MoE weights (sparse, "sleeping" most tokens) stay in RAM; dense/attention layers stay on GPU |
-| 3. Disable mmap | `--no-mmap` | Forces full preload into RAM — **later reverted, see §5** |
-| 4. Reclaim idle VRAM | lower `--n-cpu-moe` incrementally | Manual, error-prone process of finding the largest N that doesn't OOM |
-| 5. TurboQuant KV cache | `-ctk turbo4 -ctv turbo3` | Not available — mainline/Vulkan build doesn't have these types |
+### Reference Video Steps vs. Laptop Adaptation Matrix
 
-Step 4 in particular — manually decrementing `--n-cpu-moe` and re-checking `nvidia-smi` after each load — was later found to be unnecessary. `llama-server` ships a **`--fit`** flag (on by default in recent builds) that performs this exact search automatically, per-tensor, with finer granularity than manual stepping:
+| Step | Codacus Video (GTX 1060 Desktop) | Laptop Adaptation (RTX 4050 6GB Laptop) | Result & Technical Rationale |
+|---|---|---|---|
+| 1. Naive baseline | `-L 20` (3 t/s) | Skipped naive split | Unusable — MoE layers straddle the PCIe bus |
+| 2. Pin experts to CPU | `--n-cpu-moe 41` (10 t/s) | Replaced with `--fit` (`-fitt 400`) | `--fit` automatically performs per-tensor VRAM search, matching/beating manual stepping |
+| 3. Disable mmap | `--no-mmap` (13.5 t/s) | **Reverted to default `mmap`** | `--no-mmap` caused `std::bad_alloc` (`0xc0000409`) on 24GB Windows (see §5) |
+| 4. Reclaim idle VRAM | `--n-cpu-moe 35` (17 t/s) | Handled by `--fit` | Auto-fits max dense layers on GPU without manual `--n-cpu-moe` guessing |
+| 5. TurboQuant KV cache | `-ctk turbo4 -ctv turbo3` (256k) | `-ctk turbo4 -ctv turbo3` (128k default) | Mainline Vulkan lacked kernels; CUDA build enabled TurboQuant. **128k context selected for higher agent audit thoroughness** (see §7) |
+| 6. Lock RAM allocation | `--mlock` | Omitted | Avoids non-swappable RAM pressure near the 24GB Windows memory limit |
+| 7. Speculative decoding | Tested & Rejected (11 t/s drop) | Rejected | Confirmed SSM & MoE sequential routing penalty slows generation |
+
+### Why `--fit` Replaced Manual `--n-cpu-moe` Stepping
+Manual decrementing of `--n-cpu-moe` is error-prone. `llama-server` ships a **`--fit`** flag (on by default in recent builds) that performs this exact search automatically, per-tensor, with finer granularity than manual stepping:
 
 ```
 -fit,  --fit [on|off]        adjust unset arguments to fit device memory (default: on)
@@ -86,7 +99,7 @@ Step 4 in particular — manually decrementing `--n-cpu-moe` and re-checking `nv
 -fitc, --fit-ctx N           minimum context size fit can settle for
 ```
 
-Leaving `--n-cpu-moe`/`-ngl` **unset** and letting `-fit` decide consistently matched or beat manual tuning, and its log output (`common_params_fit_impl`) is genuinely informative — it walks through dense-only, full-offload, and partial-overflow scenarios and reports the exact layer/VRAM tradeoff it settled on.
+Leaving `--n-cpu-moe`/`-ngl` **unset** and letting `-fit` decide consistently matched or beat manual tuning, and its log output (`common_params_fit_impl`) reports the exact layer/VRAM tradeoff it settled on.
 
 ---
 
