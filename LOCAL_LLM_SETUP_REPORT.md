@@ -258,6 +258,56 @@ C:\llama-turboquant\build\bin\Release\llama-server.exe `
 
 ---
 
+## 13. Follow-up: The Three Remaining Levers (64K, Prefetch, MTP) — All Tested, All Rejected
+
+After the 128K decision, three acceleration ideas still looked plausible *on paper* and deserved a real test rather than a hand-wave. All three were run on a **second self-built fork used purely as a test vehicle** — `thecodacus/llama.cpp`, branch `fable5/turboquant` — while the production setup stayed on the TheTom build from §7. Bottom line up front: **none of the three nets positive on this hardware, and the production 128K config stands unchanged.**
+
+### 13.1 What was tested, and the reasoning that made each plausible
+
+| Lever | Why it *might* have helped | Verdict |
+|---|---|---|
+| **64K context** (vs 128K) | Smaller KV cache → less per-token scan → maybe faster decode | **No speed win** |
+| **Expert prefetch** | Overlap the next layer's expert H2D copy with current compute → hide PCIe latency | **Net loss** |
+| **MTP self-speculation** (`Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL`) | Model's own Multi-Token-Prediction head drafts ahead — no separate draft model, sidestepping the §1-step-7 spec-decoding penalty | **Net loss** |
+
+### 13.2 Harness
+
+Single fixed prompt (~2,755 tokens), `<think>` enabled, a real 128-token decode measured (not just prompt-processing), `-fitt 400`, `turbo4`/`turbo3` KV, flash-attention on. Both **prefill and decode** throughput captured so the two phases can't hide behind one blended number.
+
+### 13.3 Base-model context ladder (turbo KV, identical prompt)
+
+| Context allocation | Prefill t/s | Decode t/s |
+|---|---|---|
+| 8K | 18.1 | 4.51 |
+| 64K | 17.2 | 4.74 |
+| 128K | 17.0 | 5.37 |
+
+**Prefill and decode are flat across all three allocations.** The reason: only the ~2,755 actual prompt tokens ever occupy the KV cache, regardless of the `-c` ceiling, and `--fit` rebalances the CPU/GPU offload to roughly the same margin each time. Context *allocation* size barely moves per-token speed at a fixed depth — what actually costs you is real context *depth* (§7's decay past 100K), which no allocation choice removes.
+
+### 13.4 The 64K matrix (turbo KV)
+
+| Config | Prefill t/s | Decode t/s | VRAM free (idle) |
+|---|---|---|---|
+| Base, prefetch off | 17.2 | 4.74 | 873 MiB |
+| Base, **prefetch on** + `-fitt 1500` (≈2 GB reserved) | 15.0 | 4.32 | 2046 MiB |
+| MTP model, MTP off | 17.2 | 4.11 | 948 MiB |
+| MTP model, **MTP on** (68% accept) | 16.4 | 4.58 | 878 MiB |
+
+- **Prefetch loses even when handed 2 GB of free VRAM to work with.** Reserving that headroom (`-fitt 1500`) forces `--fit` to push more of the model onto the CPU, and the extra offload costs more than the copy/compute overlap saves (15.0 < 17.2 prefill). Prefetch only ever won under a *fixed* non-`--fit` offload that left VRAM idle; under the real `--fit`-driven config it has nothing to reclaim.
+- **MTP helps its own model (+11%, 4.11 → 4.58 decode) but still lands below plain base (4.74).** The MTP variant is ~1.5 GB larger on disk → more forced offload → a size penalty that outweighs the speculation gain. Same shape of result as the §1-step-7 draft-model rejection, reached by a different route.
+
+### 13.5 Critical build caveat — these absolutes are NOT the production numbers
+
+The test-vehicle fork's turbo dequant is **slow**: the *same* base model at 8K measured **21.97 t/s with f16 KV vs 4.51 t/s with turbo KV — a ~5× decode penalty** on this fork specifically. The production TheTom build in §7 sustains ~14 t/s at 128K *with* turbo, i.e. TheTom's turbo dequant kernel is far better optimized than thecodacus's.
+
+**So read §13 for the *relative* comparisons only — not the absolute t/s.** The test fork was a measurement instrument, never a production candidate; the ~4–5 t/s decode figures here are an artifact of its slow dequant, not a property of the hardware or of TurboQuant in general. **Do not migrate production to the thecodacus fork.**
+
+### 13.6 The 64K question is about thoroughness, not speed
+
+Speed gives **zero** reason to drop to 64K — §13.3 settles that. The only remaining argument for 64K is the §7 thoroughness effect: a smaller window forces more read/verify chunking, which for this class of multi-document audit produced *more* contradictions caught, not fewer. Whether that holds at 64K is an **agent-audit-quality experiment** (contradictions found + wall-clock on the real Hermes task), not a throughput benchmark — and the risk to watch is cross-document contradiction-catching weakening if the planning docs stop co-fitting under a 64K window. Until that experiment is run, **128K remains the default**, exactly as §7 concluded.
+
+---
+
 ## Appendix: Verified vs. Assumed Claims
 
 | Claim | Status |
@@ -268,3 +318,7 @@ C:\llama-turboquant\build\bin\Release\llama-server.exe `
 | Q3 ≈ Q4 quality on this architecture | Partially verified — literature-supported, spot-checked via output comparison, not exhaustively benchmarked |
 | 128K > 256K for multi-document agent correctness | Verified for this specific task class — explicitly *not* claimed as universal |
 | `mlock` scope is per-process, releases fully on exit | Verified — behavior confirmed conceptually, consistent with documented Windows API semantics |
+| 64K offers no raw-speed win over 128K at fixed depth | Verified — prefill/decode flat across 8K/64K/128K on the test fork (§13.3) |
+| Expert prefetch nets negative under `--fit` | Verified — loses even with ~2 GB reserved VRAM (§13.4) |
+| MTP self-speculation nets negative | Verified — helps its own model but stays below plain base decode (§13.4) |
+| thecodacus fork turbo dequant ~5× slower than TheTom's | Verified — 21.97 (f16) vs 4.51 (turbo) t/s at 8K, same model (§13.5); absolutes in §13 are relative-only |
