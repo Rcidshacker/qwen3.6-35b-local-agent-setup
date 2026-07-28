@@ -38,7 +38,7 @@ Running a 35B parameter mixture-of-experts (MoE) LLM locally usually requires 24
 - **Model:** `Qwen3.6-35B-A3B` (256 MoE experts, 8 active per token, hybrid SSM/Mamba + Attention).
 - **Quantization:** `Q3_K_XL` (~15.7 GB on disk), matching `Q4_K_XL` in task performance while preserving vital system RAM headroom.
 - **Backend:** Custom MSVC + CUDA 13.3 build of `TheTom/llama-cpp-turboquant` (`feature/turboquant-kv-cache`).
-- **Context Window:** **128,072 tokens** supported stably at ~14 t/s initial generation speed.
+- **Context Window:** **131,072 tokens** supported stably at ~14 t/s initial generation speed.
 - **Agent Integration:** Connected via standard OpenAI API endpoint to local **Hermes Agent**.
 
 ---
@@ -149,8 +149,7 @@ Open PowerShell as Administrator and navigate to Visual Studio Build Tools:
 
 ```powershell
 # Launch 64-bit MSVC environment
-Import-Module "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-Send-VsDevShell -VsInstallFolder "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" -Arch amd64 -HostArch amd64
+& "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
 
 # Verify 64-bit compiler resolution
 where.exe cl.exe
@@ -203,7 +202,7 @@ C:\llama-turboquant\build\bin\Release\llama-server.exe `
 
 ## 🤖 Automated Startup
 
-Use the included PowerShell startup script [`start_agent.ps1`](file:///c:/Users/Lenovo/Desktop/Code/2026/LOCAL_LLM_SETUP/start_agent.ps1) to launch the server, poll health status, and boot your agent app:
+Use the included PowerShell startup script [`start_agent.ps1`](start_agent.ps1) to launch the server, poll health status, and boot your agent app:
 
 ```powershell
 .\start_agent.ps1 -ModelPath "C:\models\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
@@ -248,7 +247,7 @@ If `llama-server` crashes immediately upon launch with code `0xc0000409`, remove
 
 For an in-depth empirical log detailing trial failures, quant quality comparisons, and raw agent task metrics, read the full engineering report:
 
-🔗 **[LOCAL_LLM_SETUP_REPORT.md](file:///c:/Users/Lenovo/Desktop/Code/2026/LOCAL_LLM_SETUP/LOCAL_LLM_SETUP_REPORT.md)**
+🔗 **[LOCAL_LLM_SETUP_REPORT.md](LOCAL_LLM_SETUP_REPORT.md)**
 
 ---
 
