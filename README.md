@@ -38,7 +38,8 @@ Running a 35B parameter mixture-of-experts (MoE) LLM locally usually requires 24
 - **Model:** `Qwen3.6-35B-A3B` (256 MoE experts, 8 active per token, hybrid SSM/Mamba + Attention).
 - **Quantization:** `Q3_K_XL` (~15.7 GB on disk), matching `Q4_K_XL` in task performance while preserving vital system RAM headroom.
 - **Backend:** Custom MSVC + CUDA 13.3 build of `TheTom/llama-cpp-turboquant` (`feature/turboquant-kv-cache`).
-- **Context Window:** **131,072 tokens** supported stably at ~14 t/s initial generation speed.
+- **Context Window:** **131,072 tokens** supported stably (~20–26 t/s decode on the production build).
+- **Prefill Tuning:** `-ub 2048` nearly **doubles prompt-processing** (482 → **878 t/s**) — the metric that actually governs agent latency (agents are prefill-bound). See [§14](LOCAL_LLM_SETUP_REPORT.md).
 - **Agent Integration:** Connected via standard OpenAI API endpoint to local **Hermes Agent**.
 
 ---
@@ -99,6 +100,8 @@ flowchart TB
    Instead of manually tuning `--n-cpu-moe`, `llama.cpp`'s auto-fit parameters (`-fit -fitt 400`) dynamically evaluate VRAM per-tensor, placing maximum dense layers on GPU while cleanly overflowing experts to host RAM.
 3. **`mmap` Over `--no-mmap` / `mlock`:**
    On a 24GB total RAM budget, forcing `--no-mmap` or `mlock` causes Windows `std::bad_alloc` crashes (`0xc0000409 STATUS_STACK_BUFFER_OVERRUN`). Standard OS memory-mapped file loading (`mmap`) prevents hard allocations while keeping paging manageable.
+4. **Agents Are Prefill-Bound — Tune `-ub`, Not Decode:**
+   An agent re-reads its system prompt, tool defs, and files every turn — that is prefill, not decode. Raising `-ub` from 512 to **2048** lifted prefill **+82%** (482→878 t/s) with decode unchanged, and fits 128K because the KV cache is pre-allocated at load (no deep-context OOM). Threads (`-t 10`==`15`) and looser V-compression (`turbo2`) gave no gain on this rig. This is the only change that netted a *verified* speed win — because it targets the metric agents actually wait on.
 
 ---
 
@@ -111,6 +114,8 @@ flowchart TB
 | **64K** | Yes | ~1061 MiB | ~17 t/s | ~7.2 GB | Stable (No TurboQuant required) |
 | **128K** | **Yes** | **~992 MiB** | **~14 t/s** | **~5.5 GB** | **Optimal Default (Proven Quality)** |
 | **256K** | Yes | ~850 MiB | ~11–13 t/s | ~3.8 GB | High RAM pressure near limit |
+
+> *Generation-speed column reflects early/conservative readings. Re-measured on the production build, warm decode is ~20–26 t/s and prefill ~482 t/s (878 with `-ub 2048`) — see [§14](LOCAL_LLM_SETUP_REPORT.md).*
 
 ### Real-World Autonomous Agent Audit (Hermes Agent Task)
 
@@ -183,6 +188,7 @@ C:\llama-turboquant\build\bin\Release\llama-server.exe `
   --parallel 1 `
   --port 8080 `
   -fitt 400 `
+  -ub 2048 `
   -ctk turbo4 `
   -ctv turbo3
 ```
@@ -195,6 +201,7 @@ C:\llama-turboquant\build\bin\Release\llama-server.exe `
 | `-c` | `131072` | Sets usable context length to 128K tokens |
 | `--parallel` | `1` | Restricts to 1 parallel request stream (maximizes VRAM for single agent) |
 | `-fitt` | `400` | Reserves 400 MiB safety margin for VRAM allocation |
+| `-ub` | `2048` | Prefill batch size — **+82% prompt-processing** (482→878 t/s) vs default 512, decode unchanged, fits 128K KV in 6GB. Drop to `1024` if a config OOMs. |
 | `-ctk` | `turbo4` | Enables 4-bit TurboQuant Key KV-cache compression |
 | `-ctv` | `turbo3` | Enables 3-bit TurboQuant Value KV-cache compression |
 
@@ -248,6 +255,10 @@ If `llama-server` crashes immediately upon launch with code `0xc0000409`, remove
 For an in-depth empirical log detailing trial failures, quant quality comparisons, and raw agent task metrics, read the full engineering report:
 
 🔗 **[LOCAL_LLM_SETUP_REPORT.md](LOCAL_LLM_SETUP_REPORT.md)**
+
+Highlights beyond this README:
+- **§13** — follow-up acceleration tests, all rejected: expert prefetch, MTP self-speculation, and 64K-for-speed (no win over 128K); plus why the earlier test-fork numbers were ~5× low.
+- **§14** — the prefill-tuning win (`-ub 2048`, +82%) and the settled agent config.
 
 ---
 
