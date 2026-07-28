@@ -308,6 +308,64 @@ Speed gives **zero** reason to drop to 64K — §13.3 settles that. The only rem
 
 ---
 
+## 14. Prefill Tuning — the one free win (`-ub 2048`), and correcting the record
+
+Prompted by a second Codacus video ("Build a Local Coding Agent on a Budget GPU"), which makes
+one load-bearing point: **agent workloads are prefill-bound, not decode-bound.** An agent
+re-reads its system prompt + tool defs + MCP content + files every turn — that is prompt
+processing (prefill), not token generation (decode). Prior sections optimized decode; this one
+measures and tunes prefill on the **production TheTom build** (not the slow codacus fork).
+
+### 14.1 Correcting the record — the slow-fork numbers were ~5–10× low
+All §13 absolute throughput came from the slow `thecodacus` fork. Measured on the real
+production build (warm, `<think>` off, ~3600-token prompt, 128K context):
+
+| Metric | Slow codacus fork (§13) | **Production TheTom build (real)** |
+| --- | --- | --- |
+| Prefill | ~17 t/s | **482 t/s** (`-ub 512` default) |
+| Decode | ~4.5 t/s | **~26 t/s** |
+
+The production rig was never as slow as the test-fork data implied. (A one-off cold-start
+request read 147 t/s prefill — that was cold GPU clocks + first-graph build, not steady state.)
+
+### 14.2 Clean knob sweep (production build, 128K, averaged, one server at a time)
+
+| Config | Prefill t/s | Decode t/s | VRAM used |
+| --- | --- | --- | --- |
+| `-ub 512`  `-t 10` turbo3 (default) | 481.8 | 26.4 | 4920 MiB |
+| `-ub 1024` `-t 10` turbo3 | 679.7 | 25.4 | 4908 MiB |
+| **`-ub 2048` `-t 10` turbo3 (chosen)** | **878.0** | 24.1 | 4954 MiB |
+| `-ub 1024` `-t 15` turbo3 | 681.1 | 25.8 | 4908 MiB |
+| `-ub 1024` `-t 10` turbo2 | 672.0 | 23.8 | 4878 MiB |
+
+Data-integrity note: an initial sweep was **discarded** — a script bug killed the wrong PID
+(MSYS pid, not Windows pid), so up to 7 servers stacked on the 6 GB GPU and thrashed. Tell:
+decode appeared to change with `-ub`, which is physically impossible (ubatch touches only
+prefill). The clean re-run gates on "GPU actually freed" before each launch; decode staying
+flat (24–26) across all `-ub` confirms it.
+
+### 14.3 Findings
+- **`-ub 2048` → +82% prefill** (482 → 878 t/s), decode unchanged (~26 → ~24). The video's #1
+  knob works on 6 GB too. **It fits at 128K** — the KV cache is pre-allocated for `-c 131072`
+  at load, so the 4954 MiB figure already includes full-context KV; no deep-context OOM risk.
+- **Threads: no gain.** `-t 10` == `-t 15` (679.7 vs 681.1). Keep 10 (leave the E-cores/OS headroom).
+- **turbo2 for V: no gain, slightly worse decode.** Keep turbo3. VRAM was not the binding
+  constraint here, so turbo2's free-VRAM benefit never triggered (it helps only when a freed
+  expert layer can move to GPU — not the case at these ubatch sizes on this model).
+
+### 14.4 Applied change
+`start_agent.ps1` now launches with `-ub 2048` (param `$UBatch`, drop to 1024 if a future
+config OOMs). Settled agent config: **`-ub 2048 -t 10 -ctk turbo4 -ctv turbo3`, 128K.** This is
+the first change all project that nets a real, verified speed win on this hardware — because it
+targets prefill (the metric that actually governs agent latency) rather than decode.
+
+### 14.5 Open (next session)
+- **REAP-pruned model** (`Qwen3.6-28B-REAP20-A3B`): ~20% experts stripped → less offload →
+  potentially faster both phases at near-equal quality. Untested; ~10 GB download. Compare
+  against the current 35B-A3B on the same prefill/decode harness.
+
+---
+
 ## Appendix: Verified vs. Assumed Claims
 
 | Claim | Status |
@@ -322,3 +380,7 @@ Speed gives **zero** reason to drop to 64K — §13.3 settles that. The only rem
 | Expert prefetch nets negative under `--fit` | Verified — loses even with ~2 GB reserved VRAM (§13.4) |
 | MTP self-speculation nets negative | Verified — helps its own model but stays below plain base decode (§13.4) |
 | thecodacus fork turbo dequant ~5× slower than TheTom's | Verified — 21.97 (f16) vs 4.51 (turbo) t/s at 8K, same model (§13.5); absolutes in §13 are relative-only |
+| Agent latency is prefill-bound, not decode-bound | Adopted from Codacus video; consistent with agent re-reading full prompt each turn (§14) |
+| `-ub 2048` gives +82% prefill, decode unchanged, fits 128K in 6GB | Verified — clean averaged sweep on production build, 482→878 t/s (§14.2) |
+| Production real prefill/decode = ~482 / ~26 t/s (not §13's ~17 / ~4.5) | Verified — §13 numbers were slow-fork artifacts (§14.1) |
+| Threads and turbo2-V give no gain on this rig | Verified — t10==t15; turbo2 slightly worse decode (§14.3) |

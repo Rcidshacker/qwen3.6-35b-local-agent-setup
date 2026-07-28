@@ -17,7 +17,8 @@ param (
     [string]$AgentExe  = "$env:LOCALAPPDATA\Programs\Hermes\Hermes.exe",
     [int]$ContextSize = 131072,
     [int]$Port        = 8080,
-    [int]$FitTarget   = 400
+    [int]$FitTarget   = 400,
+    [int]$UBatch      = 2048   # prefill batch: 2048 ~doubles agent prompt-processing (482->878 t/s) vs default 512, decode unchanged, fits 128K KV in 6GB. Drop to 1024 if OOM.
 )
 
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -39,7 +40,7 @@ if (-not $existing) {
         exit 1
     }
 
-    Write-Host "[+] Starting llama-server with TurboQuant (KV: turbo4/turbo3, Context: $ContextSize)..." -ForegroundColor Yellow
+    Write-Host "[+] Starting llama-server with TurboQuant (KV: turbo4/turbo3, Context: $ContextSize, uBatch: $UBatch)..." -ForegroundColor Yellow
 
     Start-Process -FilePath $ServerExe -ArgumentList @(
         "-m", "`"$ModelPath`"",
@@ -47,6 +48,7 @@ if (-not $existing) {
         "--parallel", "1",
         "--port", "$Port",
         "-fitt", "$FitTarget",
+        "-ub", "$UBatch",
         "-ctk", "turbo4",
         "-ctv", "turbo3"
     ) -WindowStyle Minimized
