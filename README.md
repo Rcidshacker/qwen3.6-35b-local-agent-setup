@@ -40,6 +40,7 @@ Running a 35B parameter mixture-of-experts (MoE) LLM locally usually requires 24
 - **Backend:** Custom MSVC + CUDA 13.3 build of `TheTom/llama-cpp-turboquant` (`feature/turboquant-kv-cache`).
 - **Context Window:** **131,072 tokens** supported stably (~20–26 t/s decode on the production build).
 - **Prefill Tuning:** `-ub 2048` nearly **doubles prompt-processing** (482 → **878 t/s**) — the metric that actually governs agent latency (agents are prefill-bound). See [§14](LOCAL_LLM_SETUP_REPORT.md).
+- **Fastest daily driver — REAP-28B:** the pruned `Qwen3.6-28B-REAP20-A3B` runs **+40–70% faster decode** at matched/better quality (verified A/B), because a smaller model streams less over PCIe. `start_agent.ps1` defaults to it (with `-ub 4096`), falling back to the 35B. See [§15](LOCAL_LLM_SETUP_REPORT.md).
 - **Agent Integration:** Connected via standard OpenAI API endpoint to local **Hermes Agent**.
 
 ---

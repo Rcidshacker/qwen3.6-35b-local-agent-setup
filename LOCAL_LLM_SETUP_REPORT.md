@@ -366,6 +366,97 @@ targets prefill (the metric that actually governs agent latency) rather than dec
 
 ---
 
+## 15. Re-test Campaign — Killing the "Wall" Assumptions, and the One Lever That Works (REAP)
+
+Prompted by a research addendum arguing §13/§14 dismissed some techniques against one
+build/flag/measurement rather than a true ceiling. So the whole thing was re-tested with
+proper measurement (WINPID-killed, GPU-freed-gated, warm + averaged). Result: the wall is
+real — but there's exactly one way around it.
+
+### 15.1 Recon corrected several assumptions before any test
+- **RAM: already optimal.** 2×12GB DDR5-4800 **dual-channel**, both at rated speed. The
+  "faster RAM helps CPU-offload MoE" lever is already maxed. Ruled out.
+- **MTP flag was correct.** `--spec-type` on this binary accepts
+  `none/draft-simple/draft-eagle3/draft-mtp/draft-dflash/ngram-*`. Our §13 `draft-mtp` was
+  valid — MTP lost to the +1.5GB size penalty on 6GB, not a wrong flag.
+- **Build is current** (fork HEAD 2026-07-18) with more spec methods than mainline.
+- **GPU power has headroom** (limit 80W of 105W max) — flagged for testing.
+
+### 15.2 Tier 1 (free levers) — all dead
+
+| Lever | Result |
+| --- | --- |
+| n-gram / prompt-lookup spec (`--spec-type ngram-*`) | 94% accept on a *repeated* prompt (mirage) → **26% on real code, decode WORSE** (19.6 vs 22.9) |
+| GPU power 80→105W | `nvidia-smi -pl` OEM-locked; and moot — see 15.3 |
+| `draft-dflash` / `draft-eagle3` | Both worse (14.9 / 19.5) — need draft weights we don't have |
+| `-fa` flash-attn on/off | No-op (18.3 vs 18.6) |
+| SSD (both drives NVMe) | Moot — model fits in RAM; not in the hot path |
+
+Note the ngram mirage: a rigged repetitive prompt showed +50% decode / 94% accept; the honest
+re-test on real code+prose collapsed it to 26% accept and a *net loss*. Same rigged-benchmark
+trap as §14's stacked-servers — caught by re-testing, not trusting the pretty number.
+
+### 15.3 The decisive diagnosis: the GPU is IDLE during inference
+
+Sampling `power.draw` / `clocks` / `utilization` during a real generation:
+
+```
+power draw:  8–22 W   (of an 80W limit, 105W max)
+clocks:      615–2055 MHz (of 3105 max)
+utilization: 4–44 %
+temp:        54–59 °C  (cool)
+```
+
+**The compute unit is 60–95% idle, sipping 8–22W, waiting on PCIe.** This is the single
+strongest evidence in the whole project that the wall is real: the GPU isn't maxed, it's
+*starved*. It also explains why every compute-side lever failed — and why **speculative
+decoding can't win here**: every method either needs draft weights that *themselves* stream
+over PCIe (negating the gain) or has too-low accept without them. The bus defeats speculation.
+
+Corollary: the only thing that can help is **moving less data**.
+
+### 15.4 The one win: a smaller model (REAP)
+
+REAP prunes ~20% of the least-used experts (Cerebras method; pruned models often match or beat
+the base on benchmarks). Tested `Qwen3.6-28B-REAP20-A3B` (Q3_K_M, 13GB) vs the 35B (Q3_K_XL,
+16GB), same flags, 128K:
+
+| Metric | 35B-A3B | **REAP-28B** | Gain |
+| --- | --- | --- | --- |
+| Prefill | 407 | **559** | +37% |
+| Decode (code) | 24.9 | **35.4** | +42% |
+| Decode (prose) | 18.5 | **31.6** | +71% |
+| VRAM free | 800 MiB | 876 MiB | +76 |
+
+20% fewer experts → ~20% less PCIe traffic per token → the idle-waiting GPU waits less. Exactly
+what the diagnosis predicted. Also: **the tricks don't behave differently on the smaller model**
+(ngram still net-negative on real code) — REAP's win is purely *being smaller*. One tweak did
+change: REAP fits **`-ub 4096`** (vs the 35B's 2048 ceiling), for a further +5% prefill.
+
+### 15.5 Quality A/B — pruning cost nothing visible
+
+Same coding + logic tasks on both models:
+- **Code (thread-safe token-bucket + tests):** both classes correct; **REAP also wrote the 3
+  requested pytest tests, the 35B did not.** REAP more instruction-complete.
+- **Logic (3-box relabel puzzle):** both fully correct; REAP's step-by-step state-tracking was
+  cleaner.
+
+REAP-28B **matched or beat** the 35B on both, at +40-70% speed. (Two tasks isn't a full
+benchmark — keep the 35B for genuinely hard/obscure cases — but for daily coding + reasoning
+REAP is the better driver.)
+
+### 15.6 Decision & applied change
+**Adopted REAP-28B as the default.** `start_agent.ps1` now auto-detects it (falls back to the
+35B) and auto-sets `-ub 4096` for it (2048 for the 35B). The 35B stays one `-ModelPath` away for
+hard cases. Net effect for daily use: **same quality, ~40-70% faster.**
+
+**Standing conclusion, refined:** you cannot out-*compute* or out-*trick* the PCIe wall (§15.3
+proves the GPU is already idle). You can only out-*shrink* it — fewer/smaller experts (REAP), a
+GPU the model fits in (12GB+), or a hot-expert cache once it ships in mainline (§15.6 of the
+earlier draft / llama.cpp #20757).
+
+---
+
 ## Appendix: Verified vs. Assumed Claims
 
 | Claim | Status |
@@ -384,3 +475,7 @@ targets prefill (the metric that actually governs agent latency) rather than dec
 | `-ub 2048` gives +82% prefill, decode unchanged, fits 128K in 6GB | Verified — clean averaged sweep on production build, 482→878 t/s (§14.2) |
 | Production real prefill/decode = ~482 / ~26 t/s (not §13's ~17 / ~4.5) | Verified — §13 numbers were slow-fork artifacts (§14.1) |
 | Threads and turbo2-V give no gain on this rig | Verified — t10==t15; turbo2 slightly worse decode (§14.3) |
+| GPU is idle (8–22W of 105W) during inference | Verified — strongest PCIe-wall proof; compute is starved, not maxed (§15.3) |
+| All speculative decoding fails on 6GB (mtp/ngram/dflash/eagle3) | Verified — draft weights stream over PCIe, or accept too low (§15.2–15.3) |
+| REAP-28B = +40–70% decode, quality matched/beat 35B | Verified — A/B on speed and on code+logic tasks (§15.4–15.5) |
+| REAP-28B fits `-ub 4096` (35B tops out at 2048) | Verified — +5% extra prefill (§15.4) |

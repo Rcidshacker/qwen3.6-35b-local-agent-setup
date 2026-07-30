@@ -17,19 +17,25 @@
 
 param (
     [string]$ServerExe = "C:\llama-turboquant\build\bin\Release\llama-server.exe",
-    [string]$ModelPath = "",    # blank -> auto-detect Q3_K_XL GGUF in the HF cache / C:\models (or pass explicitly)
+    [string]$ModelPath = "",    # blank -> auto-detect: prefer faster REAP-28B, else the 35B (or pass explicitly)
     [string]$AgentExe  = "",    # blank -> auto-detect Hermes.exe under %LOCALAPPDATA%\hermes (or pass explicitly)
     [int]$ContextSize  = 131072,
     [int]$Port         = 8080,
     [int]$FitTarget    = 400,
-    [int]$UBatch       = 2048   # prefill batch: 2048 ~doubles prompt-processing (482->878 t/s) vs default 512; decode unchanged; fits 128K KV in 6GB. Drop to 1024 if a config OOMs.
+    [int]$UBatch       = 0      # 0 = auto (4096 for REAP-28B, its optimum; 2048 for the 35B). Override with any explicit value.
 )
 
 # --- Auto-detect model + agent when not passed explicitly ---
 if (-not $ModelPath -or -not (Test-Path $ModelPath)) {
-    $searchDirs = @("$env:USERPROFILE\.cache\huggingface\hub", "C:\models") | Where-Object { Test-Path $_ }
-    $hit = Get-ChildItem $searchDirs -Recurse -Filter "*A3B*Q3_K_XL*.gguf" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $searchDirs = @("$env:USERPROFILE\llama_models", "$env:USERPROFILE\.cache\huggingface\hub", "C:\models") | Where-Object { Test-Path $_ }
+    # Prefer the faster REAP-28B (matches/beats 35B quality at +40-70% speed on this 6GB rig); fall back to the 35B.
+    $hit = Get-ChildItem $searchDirs -Recurse -Filter "*28B*REAP*.gguf" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $hit) { $hit = Get-ChildItem $searchDirs -Recurse -Filter "*A3B*Q3_K_*.gguf" -ErrorAction SilentlyContinue | Select-Object -First 1 }
     if ($hit) { $ModelPath = $hit.FullName }
+}
+# Auto ubatch: REAP-28B fits -ub 4096 (its optimum); the larger 35B tops out at 2048.
+if ($UBatch -le 0) {
+    if ($ModelPath -match '28B|REAP') { $UBatch = 4096 } else { $UBatch = 2048 }
 }
 if (-not $AgentExe -or -not (Test-Path $AgentExe)) {
     $hermesRoot = "$env:LOCALAPPDATA\hermes"
