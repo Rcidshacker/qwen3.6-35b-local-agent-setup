@@ -428,10 +428,13 @@ the base on benchmarks). Tested `Qwen3.6-28B-REAP20-A3B` (Q3_K_M, 13GB) vs the 3
 | Decode (prose) | 18.5 | **31.6** | +71% |
 | VRAM free | 800 MiB | 876 MiB | +76 |
 
-20% fewer experts → ~20% less PCIe traffic per token → the idle-waiting GPU waits less. Exactly
-what the diagnosis predicted. Also: **the tricks don't behave differently on the smaller model**
-(ngram still net-negative on real code) — REAP's win is purely *being smaller*. One tweak did
-change: REAP fits **`-ub 4096`** (vs the 35B's 2048 ceiling), for a further +5% prefill.
+Fewer *total* experts (205 vs 256) → a larger fraction stays GPU-resident under `--fit` → fewer
+of the 8 active experts trigger a live PCIe fetch. **Note the mechanism is residency rate, not
+"less traffic per token":** §16 dumps both GGUFs and finds REAP actually streams ~7% *more* per
+token (it ships as Q3_K_M; the 35B is a lighter Q3_K_XL dynamic mix), yet is faster — so the win
+cannot be "being smaller per token." See §16.4 for the corrected accounting. Also: **the tricks
+don't behave differently on the smaller model** (ngram still net-negative on real code). One tweak
+did change: REAP fits **`-ub 4096`** (vs the 35B's 2048 ceiling), for a further +5% prefill.
 
 ### 15.5 Quality A/B — pruning cost nothing visible
 
@@ -451,9 +454,106 @@ REAP is the better driver.)
 hard cases. Net effect for daily use: **same quality, ~40-70% faster.**
 
 **Standing conclusion, refined:** you cannot out-*compute* or out-*trick* the PCIe wall (§15.3
-proves the GPU is already idle). You can only out-*shrink* it — fewer/smaller experts (REAP), a
-GPU the model fits in (12GB+), or a hot-expert cache once it ships in mainline (§15.6 of the
+proves the GPU is already idle). You can only raise the **residency rate** — a smaller expert
+*pool* so more of it fits GPU-resident (REAP; quantified in §16), a lighter quant so more experts
+fit, a GPU the model fits in (12GB+), or a hot-expert cache once it ships in mainline (§15.6 of the
 earlier draft / llama.cpp #20757).
+
+---
+
+## 16. Quantifying the Wall — and Correcting Why REAP Actually Wins
+
+§15 concluded "PCIe-bound" from the idle-GPU diagnostic (8–22 W of 105 W during decode). That's
+qualitative. §16 puts numbers on it by dumping the **actual GGUF tensor tables of both production
+models** (`llama-gguf.exe <model> r n`) — measured bytes, not estimates. Two results fall out: the
+PCIe-bound conclusion is confirmed numerically, **and the §15.4 explanation of *why* REAP is faster
+turns out to be wrong.**
+
+### 16.1 Method — measured, not estimated
+Confirmed architecture straight from both files' metadata + tensor shapes: **40 layers**, hidden
+`n_embd = 2048`, expert FFN dim `n_ff_exp = 512`, **8 routed + 1 shared** expert active per token,
+SwiGLU (`ffn_gate/up/down_exps` all present). Per-expert params = `3 × 2048 × 512 = 3,145,728`.
+Active routed params/token = `40 × 8 × 3.15M ≈ 1.007 B` — identical for both models (routing width
+and expert size are unchanged by pruning). The shared expert (60 MB REAP / 134 MB 35B) fires every
+token and stays GPU-resident, so it is **not** part of the streamed set.
+
+Cross-check on the method: deriving expert count from REAP's `ffn_gate_exps` byte size (uniform
+q3_K) lands on exactly **205 = 256 × 0.8** — the expected REAP-20 prune. (The 35B's count is taken
+from config as **256**; its Unsloth *Dynamic* Q3_K_XL mixes q2_K into some layers, so byte-derivation
+under-reads it — see §16.7.)
+
+### 16.2 Bytes actually streamed per token (from real tensor sizes)
+Per-token streamed = (sum of all `ffn_*_exps` bytes) × 8 / n_expert, since all experts in a layer
+share one quant type and shape:
+
+| Model | Quant | Expert-tensor quants | Expert pool | Streamed/token | Effective bpw |
+| --- | --- | --- | --- | --- | --- |
+| 35B-A3B | Q3_K_XL (dynamic) | gate/up mixed incl. q2_K, down q3/q4 | 256 | **446 MB** | 3.55 |
+| **REAP-28B** | Q3_K_M | gate/up **q3_K**, down **q4_K** | 205 | **479 MB** | 3.81 |
+
+The 35B's "XL" dynamic quant is *lighter on average* than REAP's "M" — so REAP streams **~7% more**
+per token, not less. Hold that thought for §16.4.
+
+### 16.3 The PCIe ceiling — confirmed quantitatively
+Link: RTX 4050 Laptop (AD107) is **PCIe 4.0 ×8** → ~15.75 GB/s theoretical, **11–13.5 GB/s**
+realistic for sustained DMA. Dividing bandwidth by the measured bytes/token gives the transfer-time
+ceiling:
+
+| Model | @ 11 GB/s | @ 13.5 GB/s | @ 15.75 GB/s (theo.) |
+| --- | --- | --- | --- |
+| 35B-A3B (446 MB) | 24.7 t/s | 30.3 t/s | 35.3 t/s |
+| REAP-28B (479 MB) | 23.0 t/s | 28.2 t/s | 32.9 t/s |
+
+**Observed production decode is ~20–26 t/s** — sitting inside, at the *lower* end of, the computed
+band. Back-of-envelope physical reasoning rarely lands tighter than this. **[Confirmed] PCIe transfer
+time is the dominant term governing decode on this hardware**, not merely "a factor." Corollary:
+sitting this close to the *zero-caching* ceiling means close to **none** of the 8 active experts/layer
+hit a GPU-resident copy in the base 35B config — consistent with §15.6 (no persistent expert cache in
+current llama.cpp).
+
+### 16.4 Correcting §15.4 — REAP does **not** stream less per token
+§15.4 said: *"20% fewer experts → ~20% less PCIe traffic per token → REAP's win is purely being
+smaller."* The tensor dump refutes this directly:
+
+- Pruning removes experts from the **total pool** (256 → 205). Routing still selects **top-8**, each
+  expert **unchanged in size**. Per-token *active* bytes are therefore governed by quant, not pool
+  size — and REAP's quant is heavier, so it streams **479 MB vs the 35B's 446 MB (+7.4%)**.
+- REAP is *heavier per token* yet **+40–70% faster**. "Streams less per token" cannot be the cause;
+  the arithmetic runs the wrong way.
+
+**The real lever is residency rate — bytes *fetched*, not bytes *active*.** A smaller total pool lets
+`--fit` (`-fitt 400`) pin a larger *fraction* of experts permanently in the 6 GB, so more of any
+token's top-8 land on an already-resident expert and skip the PCIe fetch. 205/256 is a ~20% smaller
+pool to cover with the same fixed VRAM → residency climbs off the ≈0 floor of §16.3 → the idle GPU
+waits on fewer live transfers. Fewer *fetches*, despite more *active* bytes.
+
+### 16.5 The latent opportunity this exposes
+REAP-28B currently ships on a **heavier** quant (Q3_K_M) than the 35B (Q3_K_XL). The two levers —
+residency (pool size) and bytes/token (quant) — are **independent and stackable**. Re-quantizing
+REAP-28B to a q2-heavy dynamic mix (matching XL's average ~3.55 bpw, or lower) would cut ~7%+ off
+bytes/token **on top of** the residency win it already has, with **no retraining — just a re-quant
+pass**. This is a cheaper, higher-confidence next step than §16.6. *(Untested — a hypothesis the
+§16.2 numbers make concrete, not a measured result.)*
+
+### 16.6 ReMoE — orthogonal candidate, untested here
+ReMoE ([arXiv 2605.27081](https://arxiv.org/pdf/2605.27081)) raises short-horizon expert reuse via
+router fine-tuning — the **same residency lever as REAP, reached directly** instead of as a
+side-effect of pruning — and reports 1.77–1.99× decode on llama.cpp. Caveats before crediting it
+here: the cited gain is on a **Jetson Orin NX (unified memory, no discrete-GPU PCIe wall)**, a
+materially different bottleneck than this rig; and it needs a **router retrain + re-quant**, far more
+work than §16.5. Worth stacking on REAP-28B *as an experiment*, not a recommendation.
+
+### 16.7 Limitations of this section
+- Residency-rate is the best-fit explanation given the arithmetic (heavier-yet-faster only resolves
+  via fetch count), **not** cache-hit/miss instrumented on the live build — llama.cpp exposes no
+  per-expert residency counter to confirm it directly.
+- The 11–13.5 GB/s "realistic DMA" band is a general large-transfer estimate, not measured for this
+  workload's many-small-copies pattern (which could shift real efficiency either way).
+- 35B expert count is taken from config (256), since Unsloth Dynamic XL's mixed quant corrupts
+  byte-derivation; REAP's 205 was derived cleanly and matches 256 × 0.8, validating the approach.
+- Per-token bytes assume all experts in a layer share one quant/shape (confirmed true in both dumps)
+  and the shared expert stays GPU-resident (standard `--fit` placement, not re-verified for cache
+  eviction under load).
 
 ---
 
@@ -472,6 +572,10 @@ earlier draft / llama.cpp #20757).
 | MTP self-speculation nets negative | Verified — helps its own model but stays below plain base decode (§13.4) |
 | thecodacus fork turbo dequant ~5× slower than TheTom's | Verified — 21.97 (f16) vs 4.51 (turbo) t/s at 8K, same model (§13.5); absolutes in §13 are relative-only |
 | Agent latency is prefill-bound, not decode-bound | Adopted from Codacus video; consistent with agent re-reading full prompt each turn (§14) |
+| Decode is PCIe-transfer-bound (~446–479 MB/token vs 11–13.5 GB/s ≈ 23–30 t/s ceiling) | Verified — GGUF tensor dump of both models; observed 20–26 t/s sits inside the computed band (§16.2–16.3) |
+| REAP is faster because it "streams less per token" | **Refuted** — dump shows REAP streams +7.4% *more* per token (479 vs 446 MB); the win is residency rate, not size (§16.4) |
+| REAP-28B (Q3_K_M) rides a heavier quant than the 35B (Q3_K_XL); a lighter re-quant is an untapped, stackable lever | Verified quant asymmetry (dump); lighter-re-quant gain is projected, not yet tested (§16.5) |
+| Qwen3.6-A3B expert geometry: 40 layers, n_embd 2048, expert FFN 512, 8+1 active, 256→205 experts (REAP) | Verified — metadata + tensor-shape dump of both GGUFs (§16.1) |
 | `-ub 2048` gives +82% prefill, decode unchanged, fits 128K in 6GB | Verified — clean averaged sweep on production build, 482→878 t/s (§14.2) |
 | Production real prefill/decode = ~482 / ~26 t/s (not §13's ~17 / ~4.5) | Verified — §13 numbers were slow-fork artifacts (§14.1) |
 | Threads and turbo2-V give no gain on this rig | Verified — t10==t15; turbo2 slightly worse decode (§14.3) |
